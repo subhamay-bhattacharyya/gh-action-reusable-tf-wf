@@ -1,0 +1,179 @@
+name: Create Pull Request
+
+on:
+  workflow_call:
+    inputs:
+      pr-title:
+        description: 'Spefifies the Pull Request title.'
+        required: true
+        type: string
+        default: "Pull Request"
+      pr-approver:
+        description: 'Specifies the GitHub User who can approve a Pull Request.'
+        required: true
+        type: string
+      aws-region:
+        description: 'Specifies the AWS Region.'
+        required: true
+        type: string
+      aws-role-arn:
+        description: 'Specifies the AWS IAM Role arn.'
+        required: true
+        type: string
+      aws-tf-state-bucket-name:
+        description: 'Specifies the AWS S3 bucket name.'
+        required: true
+        type: string
+      # kms-key-arn: 
+      #   description: 'Specifies the AWS KMS Key arn.'
+      #   required: true
+      #   type: string
+    secrets:
+      git-token:
+        required: true
+
+permissions:
+  id-token: write # This is required for aws oidc connection
+  pull-requests: write # This is required for gh bot to comment PR
+  contents: write
+
+jobs:
+  pull-request:
+    name: "Create Pull Request"
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+        working-directory: .
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4.1.0
+        with:
+          node-version: '16'
+          
+      - name: Configure AWS credentials from AWS account
+        id: configure-aws-credentials
+        uses: aws-actions/configure-aws-credentials@v4.0.2
+        with:
+          role-to-assume: ${{ inputs.aws-role-arn }}
+          aws-region: ${{ inputs.aws-region }}
+          role-session-name: github-aws-terraform-oidc
+
+      - name: Add GitHub attributes to terraform.tfvars file
+        id: add-gihub-attributes
+        run: |
+          cd tf
+          mv params/devl.terraform.tfvars terraform.tfvars
+          echo -e '######################################## GitHub Context Variables  #################################'>> terraform.tfvars 
+          echo -e 'environment-name     = "devl"'                                                                       >> terraform.tfvars 
+          echo -e 'github-url           = "${{ github.repositoryUrl }}"'                                                >> terraform.tfvars 
+          echo -e 'github-ref           = "${{ github.ref }}"'                                                          >> terraform.tfvars 
+          echo -e 'github-sha           = "${{ github.sha }}"'                                                          >> terraform.tfvars 
+          # echo -e 'GitHubWFRunNumber  = ${{ github.run_number }}'                                                     >> terraform.tfvars 
+          echo -e 'github-repo          = "${{ github.event.repository.name }}"'                                        >> terraform.tfvars
+          # echo -e 'KmsMasterKeyId     = "${{ inputs.kms-key-arn }}"'                                                 >> terraform.tfvars 
+          echo "=========================================== terraform.tfvars ==========================================="
+          cat terraform.tfvars 
+
+      - name: Configure and cache Terraform plugin
+        id: plugin
+        uses: subhamay-bhattacharyya/9996-tf-plugin@main
+        with:
+          tf-version: ${{ inputs.terraform-ver }}
+          caching: 'true'
+
+      - name: Output Cache used
+        id: cache-used
+        run: echo "Cache used? ${{ steps.plugin.outputs.used-cache }}"
+
+      - name: Terraform Init
+        id: init
+        env:
+          AWS_BUCKET_NAME: ${{ inputs.aws-tf-state-bucket-name }}
+          AWS_BUCKET_KEY_NAME: ${{ github.event.repository.name }}
+        run: |
+          cd ${{ github.workspace }}/tf
+          terraform fmt -recursive
+          terraform init -backend-config="bucket=${{ inputs.aws-tf-state-bucket-name }}" -backend-config="key=${{ github.event.repository.name }}/terraform.tfstate" -backend-config="region=${{ inputs.aws-region }}"
+
+      - name: Terraform Plan
+        id: plan
+        run: |
+          cd ${{ github.workspace }}/tf
+          terraform plan -out ${{ github.workspace }}/tf/tf.plan
+          terraform show -no-color  ${{ github.workspace }}/tf/tf.plan > ${{ github.workspace }}/tf/tf-plan.txt
+
+      - name: Generate Pull Request Body
+        id: generate-pr-body
+        run: |  
+          sed -i '1d' ${{ github.workspace }}/tf/tf-plan.txt
+          echo "<html>"                 >> ${{ github.workspace }}/tf-plan-${{ github.sha }}.md
+          echo "  <body>"               >> ${{ github.workspace }}/tf-plan-${{ github.sha }}.md
+          echo "    <p>"                >> ${{ github.workspace }}/tf-plan-${{ github.sha }}.md
+          echo "    Pull Request request created to merge <b>${{ github.ref_name }}</b> with <b>main</b> for the repository <b>${{ github.event.repository.name }} to add/remove/update the following resources:</b>" >> ${{ github.workspace }}/tf-plan-${{ github.sha }}.md
+          echo "    </p>"               >> ${{ github.workspace }}/tf-plan-${{ github.sha }}.md
+          echo "    <font size='1'>"    >> ${{ github.workspace }}/tf-plan-${{ github.sha }}.md
+          echo "    <table>"            >> ${{ github.workspace }}/tf-plan-${{ github.sha }}.md
+          echo "          <th><img alt='Static Badge' src='https://img.shields.io/badge/Action-black?style=flat-square&color=ffffff'></th><th><img alt='Static Badge' src='https://img.shields.io/badge/Logical_Resource_Id-black?style=flat-square&color=ffffff'></th><th><img alt='Static Badge' src='https://img.shields.io/badge/Resource_Type-black?style=flat-square&color=ffffff'></th><th><img alt='Static Badge' src='https://img.shields.io/badge/Replacement-black?style=flat-square&color=ffffff'></th>" >> ${{ github.workspace }}/tf-plan-${{ github.sha }}.md
+
+          grep "resource" ${{ github.workspace }}/tf/tf-plan.txt|sed 's/{//g' > ${{ github.workspace }}/tf/tf-resources.txt
+          cat ${{ github.workspace }}/tf/tf-resources.txt
+          for line in `cat ${{ github.workspace }}/tf/tf-resources.txt| tr -s " " @|sed 's/"//g'`; do
+            action=`echo $line|cut -d"@" -f2`
+            logical_resource_id=`echo $line|cut -d"@" -f5`
+            resource_type=`echo $line|cut -d"@" -f4`
+            resource_tag=`echo $line|cut -d"@" -f3`
+            if [ $resource_tag == "resource" ]; then
+              if [ "$action" = "+" ]; then
+                replacement="-"
+                action="Add"
+              elif [ "$action" = "-" ]; then
+                replacement="Y"
+                action="Delete"
+              else
+                replacement="NA"
+                action="Update"
+              fi
+              if [ "$action" = "Add" ]; then
+                action="<img alt='Static Badge' src='https://img.shields.io/badge/Add-green?style=soc'>"
+              elif [ "$action" = "Delete" ]; then
+                action="<img alt='Static Badge' src='https://img.shields.io/badge/Delete-red?style=soc'>"
+              elif [ "$action" = "Update" ]; then
+                action="<img alt='Static Badge' src='https://img.shields.io/badge/Update-yellow?style=soc'>"
+              else
+                action="-${action}-"
+              fi
+              echo "<tr><td>$action</td><td>$logical_resource_id</td><td>$resource_type</td><td>$replacement</td></tr>"  >> ${{ github.workspace }}/tf-plan-${{ github.sha }}.md
+            fi
+          done
+          echo "    </table>"           >> ${{ github.workspace }}/tf-plan-${{ github.sha }}.md
+          echo "    </font>"            >> ${{ github.workspace }}/tf-plan-${{ github.sha }}.md
+          echo "  </body>"              >> ${{ github.workspace }}/tf-plan-${{ github.sha }}.md
+          echo "</html>"                >> ${{ github.workspace }}/tf-plan-${{ github.sha }}.md
+          echo "************** Pull Request Body ***************"
+          cat ${{ github.workspace }}/tf-plan-${{ github.sha }}.md
+
+      - name: Read file contents
+        id: read-file
+        uses: andstor/file-reader-action@v1.0.0
+        with:
+          path:  ${{ github.workspace }}/tf-plan-${{ github.sha }}.md
+
+      - name: Create Pull Request
+        id: create-pr
+        uses: octokit/request-action@v2.4.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.git-token }}
+        with:
+          route: POST /repos/{owner}/{repo}/pulls
+          owner: ${{ github.repository_owner }}
+          repo: ${{ github.event.repository.name }}
+          title: ${{ inputs.pr-title }}
+          head: ${{ github.ref_name }} 
+          base: "main"
+          body: "${{ steps.read-file.outputs.contents }}"
+          
+

@@ -1,0 +1,66 @@
+name: Create Release
+
+on:
+  workflow_call:
+permissions:
+  id-token: write # This is required for aws oidc connection
+  pull-requests: write # This is required for gh bot to comment PR
+  contents: write
+
+jobs:
+  release:
+    name: Create Release
+    outputs:
+      release-notes: ${{ steps.change-text.outputs.release-notes }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+        working-directory: .
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@main
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4.1.0
+        with:
+          node-version: '20'
+
+      - name: Print github.ref_name
+        run: |
+          echo "GitHub ref_name : ${{ github.ref_name }}"
+
+      - name: Split ref_name
+        id: split-ref-name
+        uses: xom9ikk/split@v1.1
+        with: 
+          string: ${{ github.ref_name }}
+          separator: '/'
+          limit: 2
+
+      - name: Split Feature Name
+        id: split-string
+        uses: xom9ikk/split@v1.1
+        with: 
+          string: ${{ steps.split-ref-name.outputs._1 }}
+          separator: '-'
+          limit: -1
+
+      - name: Create change text
+        id: change-text
+        run: |
+          echo "release-notes=`echo ${{ steps.split-ref-name.outputs._1 }}|cut -d"-" -f3-|sed 's/-/ /g'|awk '{$1=toupper(substr($1,0,1))substr($1,2)}1'`." >> $GITHUB_OUTPUT
+
+      - name: Create Release
+        id: create-release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.github_token }}
+        with:
+          tag_name: v${{ steps.split-string.outputs._1 }}
+          release_name: Release v${{ steps.split-string.outputs._1 }}
+          body: |
+            Changes in this Release
+              - ${{ steps.change-text.outputs.release-notes }}
+          draft: false
+          prerelease: false

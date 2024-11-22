@@ -1,0 +1,23 @@
+name: Configure AWS
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read # This is required for actions/checkout
+
+jobs:
+  checkout:
+    name: "Git Checkout"
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+        working-directory: .
+    steps:
+      ####################################################
+      ########## Checkout Code
+      ####################################################
+      - name: Git checkout
+        id: git-checkout
+        uses: actions/checkout@main

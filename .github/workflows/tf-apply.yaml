@@ -1,0 +1,158 @@
+name: Terraform Apply
+
+on:
+  workflow_call:
+    inputs:
+      github-env:
+        description: 'Specifies the GitHub deployment environment.'
+        required: false
+        type: string
+        default: "devl"
+      tfvar-file:
+        description: 'Specifies the environment specific tfvar file e.g: devl.terraform.tfvars'
+        required: true
+        type: string
+        default: devl.terraform.tfvars
+      issue-number:
+        description: 'Specifies the GitHub Issue Number.'
+        required: true
+        type: string
+      aws-region:
+        description: 'Specifies the AWS Region.'
+        required: true
+        type: string
+      aws-role-arn:
+        description: 'Specifies the AWS IAM Role arn.'
+        required: true
+        type: string
+      aws-tf-state-bucket-name:
+        description: 'Specifies the AWS S3 bucket name.'
+        required: true
+        type: string
+    secrets:
+      git-token:
+        required: true
+permissions:
+  id-token: write                       # This is required for aws oidc connection
+  contents: read                        # This is required for actions/checkout
+  pull-requests: write                  # This is required for gh bot to comment PR
+  issues: write                         # Permission to create comments on issues
+jobs:
+  apply:
+    name: "TF Apply (${{ inputs.github-env }})"
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+        working-directory: .
+    steps:
+
+      - name: Print issue number
+        id: print-issue-number
+        run: |
+          echo "issue-number: ${{ inputs.issue-number }}"
+
+      - name: Git checkout
+        id: git-checkout
+        uses: actions/checkout@v4
+
+      - name: Create the CiBuild string
+        if: startsWith(github.ref, 'refs/heads/feature')
+        id: get-ci-build-string
+        run: |
+          echo "ci-build=`echo ${{ github.ref_name }}|sed s'/\//-/g'|head -c 15| \
+          tr [:upper:] [:lower:]`-`echo ${{ github.sha }}|base64|head -c 4|tr [:upper:] [:lower:]`" >> $GITHUB_OUTPUT 
+          
+      - name: Add GitHub attributes to terraform.tfvars file
+        id: add-gihub-attributes
+        run: |
+          cd tf
+          mv params/${{ inputs.tfvar-file }} terraform.tfvars
+          echo -e '######################################## GitHub Context Variables  #################################'>> terraform.tfvars 
+          if [[ "${{ inputs.github-env }}" == "feature" ]]; then
+            echo -e 'environment_name     = "devl"'                                                                     >> terraform.tfvars 
+          else
+            echo -e 'environment_name     = "${{ inputs.github-env }}"'                                                 >> terraform.tfvars 
+          fi
+          echo -e 'github_url           = "${{ github.repositoryUrl }}"'                                                >> terraform.tfvars 
+          echo -e 'github_ref           = "${{ github.ref }}"'                                                          >> terraform.tfvars 
+          echo -e 'github_sha           = "${{ github.sha }}"'                                                          >> terraform.tfvars 
+          echo -e 'github_wf_run_num    = "${{ github.run_number }}"'                                                   >> terraform.tfvars 
+          echo -e 'github_repo          = "${{ github.event.repository.name }}"'                                        >> terraform.tfvars
+          echo "=========================================== terraform.tfvars ==========================================="
+          cat terraform.tfvars 
+
+      - name: Add CiBuild
+        if: startsWith(github.ref, 'refs/heads/feature')
+        id: add-ci-build
+        run: |
+          echo -e 'ci_build             = "-${{ steps.get-ci-build-string.outputs.ci-build }}"'                         >> tf/terraform.tfvars
+          echo "=========================================== terraform.tfvars ==========================================="
+          cat tf/terraform.tfvars
+
+      - name: Configure AWS credentials from AWS account
+        id: aws-config
+        uses: aws-actions/configure-aws-credentials@v4.0.2
+        with:
+          role-to-assume: ${{ inputs.aws-role-arn }}
+          aws-region: ${{ inputs.aws-region }}
+          role-session-name: github-aws-terraform-oidc
+
+      - name: Configure and cache Terraform plugin
+        id: plugin
+        uses: subhamay-bhattacharyya/9996-tf-plugin@main
+        with:
+          tf-version: ${{ vars.TERRAFORM_VERSION }}
+          caching: 'true'
+
+      - name: Output Cache used
+        id: cache-used
+        run: echo "Cache used? ${{ steps.plugin.outputs.used-cache }}"
+
+      - name: Terraform Init
+        id: init
+        env:
+          AWS_BUCKET_NAME: ${{ inputs.aws-tf-state-bucket-name }}
+          AWS_BUCKET_KEY_NAME: ${{ github.event.repository.name }}
+        run: |
+          cd ${{ github.workspace }}/tf
+          terraform fmt -recursive
+          terraform init -backend-config="bucket=${{ inputs.aws-tf-state-bucket-name }}" -backend-config="key=${{ github.event.repository.name }}/terraform.tfstate" -backend-config="region=${{ inputs.aws-region }}"
+
+      - name: Terraform Apply and generate output
+        id: apply
+        run: |
+          cd ${{ github.workspace }}/tf
+          terraform apply -auto-approve
+          terraform output -json|jq ".resources.value" > ${{ github.workspace }}/tf/terraform-output.json
+
+          json_file="${{ github.workspace }}/tf/terraform-output.json"
+
+          # Output HTML file
+          tf_output_file="${{ github.workspace }}/tf-output-${{ github.sha }}.md"
+
+          # Start the HTML file
+          echo "<html>"                                                                             >  $tf_output_file
+          echo "  <body>"                                                                           >> $tf_output_file
+          echo "    <p>"                >> ${{ github.workspace }}/tf-plan-${{ github.sha }}.md
+          echo "    Resources created by branch : <b>${{ github.ref_name }}</b>"                    >> $tf_output_file
+          echo "    </p>"                                                                           >> $tf_output_file
+          echo "    <font size='1'>"                                                                >> $tf_output_file          
+          echo "    <table border='1'>"                                                             >> $tf_output_file
+          # Parse the JSON file and generate the HTML table
+          jq -r 'to_entries | .[] | "<tr><td>\(.key)</td><td>\(.value)</td></tr>"' $json_file       >> $tf_output_file
+          echo "    </table>"                                                                       >> $tf_output_file
+          echo "    </font>"                                                                        >> $tf_output_file
+          echo "  </body>"                                                                          >> $tf_output_file
+          echo "</html>"                                                                            >> $tf_output_file
+          # End the HTML file
+          # chmod +wr $tf_output_file
+          # echo ${{ github.workspace }}/tf-output-${{ github.sha }}.md
+          # echo "************** Issue Comment ***************"
+          # cat $tf_output_file
+
+      - name: Add comment to the issue with the output of the terraform apply
+        run: |
+          gh issue comment ${{ inputs.issue-number }} --body "$(cat ${{ github.workspace }}/tf-output-${{ github.sha }}.md)"
+        env:
+          GH_TOKEN: ${{ github.token }}
