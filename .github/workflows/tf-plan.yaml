@@ -159,5 +159,5 @@ jobs:
           cat s3_bucket_versioning.rego
           echo "================================================================================================================="
 
-          opaout=$(opa eval --data s3_bucket_versioning.rego --input /tmp/plan.json "data.s3versioning.deny" | jq -r '.result[].expressions[].value[]')
+          opaout=$(opa eval --data s3_bucket_versioning.rego --input plan.json "data.s3versioning.deny" | jq -r '.result[].expressions[].value[]')
           echo "opaout=$opaout"
