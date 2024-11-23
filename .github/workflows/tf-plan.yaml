@@ -145,6 +145,11 @@ jobs:
         if: steps.plan.outcome == 'failure'
         run: exit 1
 
+      - name: Setup OPA
+        uses: open-policy-agent/setup-opa@v2
+        with:
+          version: latest
+
       - name: Run OPA Tests - S3 Bucket Versioning
         run: |
           cd ${{ github.workspace }}/tf/
